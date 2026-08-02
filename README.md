@@ -1,0 +1,68 @@
+# vyvyd 🎬 (MP4 to GIF, GIF Cropper & Image 9:16)
+
+브라우저 자체 리소스(WebAssembly)만을 사용하여 원본 화질 그대로 비디오를 GIF로 변환하고 크롭할 수 있는 고성능 미디어 편집 웹 애플리케이션입니다.
+
+배포 주소: [https://vyvyd.pages.dev](https://vyvyd.pages.dev)
+
+---
+
+## ✨ 핵심 기능 (Key Features)
+
+1. **고화질 MP4 to GIF 변환 (FFmpeg WASM)**
+   - 브라우저 클라이언트 내의 WebAssembly 가상 환경에서 FFmpeg 엔진을 네이티브로 실행합니다.
+   - **2단계 팔레트 추출 기법(Pass-1 Palette Gen)**을 도입하여 원본 비디오의 모든 색상 스펙트럼을 정밀하게 추출하고 색 왜곡 및 번짐을 방지합니다.
+   - **디더링 옵션 지원**: Bayer, Floyd-Steinberg 등 고성능 디더링 알고리즘 제공.
+   - **기타 조정 옵션**: 재생 구간 정밀 트리밍(Trim), 해상도 비율 조절(Scale), 프레임 레이트(FPS) 설정.
+
+2. **애니메이션 손실 없는 GIF 크롭**
+   - FFmpeg를 통해 업로드된 GIF 파일의 각 애니메이션 프레임, 딜레이 시간 및 알파 채널 투명도를 보존하면서 특정 크기 영역을 무손실 크롭합니다.
+
+3. **고급 UI 크롭 박스 (Crop Overlay)**
+   - 마우스 드래그를 통해 영역을 마음대로 지정하고 이동할 수 있습니다.
+   - 상/하/좌/우 선 경계선 및 4개 모서리(Corner) 드래그 리사이즈 핸들을 지원합니다.
+   - **Pointer Capture API**를 적용하여 마우스가 크롭 영역 밖에서 떼어지더라도 드래그 멈춤 상태가 올바르게 반응합니다.
+
+4. **100% 프라이버시 보장**
+   - 사용자가 등록한 동영상이나 이미지 파일이 서버로 전혀 업로드되지 않으며, 모든 컴퓨팅 자원 처리가 전적으로 **사용자의 로컬 브라우저 내 가상 샌드박스**에서 처리됩니다.
+
+5. **이미지 9:16 변환**
+   - 이미지를 업로드하면 원본을 상단에 그대로 배치하고 하단에 빈 공간을 추가합니다.
+   - 기본값은 투명 영역이며, 흰색 영역을 선택해 PNG로 내려받을 수도 있습니다.
+
+---
+
+## 🛠 기술 스택 (Tech Stack)
+
+- **Frontend**: React, TypeScript, Vite
+- **Styling**: Tailwind CSS
+- **Core Processing Engine**: `@ffmpeg/ffmpeg` (v0.12), `@ffmpeg/util`
+- **Deployment Platform**: Cloudflare Pages
+
+---
+
+## 🚀 시작하기 (Getting Started)
+
+### 1. 패키지 설치
+```bash
+npm install
+```
+
+### 2. 로컬 개발 서버 실행
+```bash
+npm run dev
+```
+*로컬 서버는 `http://localhost:5173`로 시작합니다.*
+
+> [!IMPORTANT]
+> 로컬 브라우저에서 FFmpeg WASM 구동(SharedArrayBuffer 기능)을 위해, Vite 개발 서버 실행 시 자동으로 Cross-Origin Isolation 헤더(`COOP`/`COEP`)가 주입되도록 `vite.config.ts` 파일이 이미 세팅되어 있습니다.
+
+### 3. 프로덕션 빌드
+```bash
+npm run build
+```
+
+### 4. 클라우드플레어 페이지 배포
+```bash
+npm run deploy
+```
+*`npm run build`를 실행한 후 Wrangler CLI를 활용하여 빌드된 `dist` 폴더를 Cloudflare Pages의 `vyvyd` 프로젝트로 배포합니다. 환경변수는 사용하지 않으며, 최초 1회만 `npx wrangler login`이 필요합니다.*
