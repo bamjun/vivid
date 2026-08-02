@@ -9,13 +9,25 @@ interface ImagePaddingProps {
 
 type BackgroundMode = 'transparent' | 'white';
 
-interface ImageDimensions {
+interface ImageItem {
+  id: string;
+  file: File;
+  src: string;
   width: number;
   height: number;
   outputHeight: number;
 }
 
-const getOutputDimensions = (width: number, height: number): ImageDimensions => ({
+interface ImageResult {
+  id: string;
+  fileName: string;
+  url: string;
+  size: number;
+  width: number;
+  height: number;
+}
+
+const getOutputDimensions = (width: number, height: number) => ({
   width,
   height,
   // Keep the original width and place the original at the top of a 9:16 canvas.
@@ -34,108 +46,168 @@ const canvasToBlob = (canvas: HTMLCanvasElement): Promise<Blob> =>
     }, 'image/png');
   });
 
+const loadImage = (src: string): Promise<HTMLImageElement> =>
+  new Promise((resolve, reject) => {
+    const image = new window.Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('이미지를 읽을 수 없습니다.'));
+    image.src = src;
+  });
+
+const getOutputFileName = (fileName: string) =>
+  `9x16_${fileName.replace(/\.[^.]+$/, '') || 'image'}.png`;
+
 export const ImagePadding: React.FC<ImagePaddingProps> = ({ onSuccess }) => {
-  const [imageFile, setImageFile] = useState<File | null>(null);
-  const [imageSrc, setImageSrc] = useState('');
-  const [imageDimensions, setImageDimensions] = useState<ImageDimensions | null>(null);
+  const [imageItems, setImageItems] = useState<ImageItem[]>([]);
   const [background, setBackground] = useState<BackgroundMode>('transparent');
+  const [isLoadingImages, setIsLoadingImages] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [resultUrl, setResultUrl] = useState('');
-  const [resultSize, setResultSize] = useState(0);
-  const imageRef = useRef<HTMLImageElement>(null);
+  const [progressIndex, setProgressIndex] = useState(0);
+  const [results, setResults] = useState<ImageResult[]>([]);
+  const [errorMessage, setErrorMessage] = useState('');
+  const imageUrlsRef = useRef<Set<string>>(new Set());
+  const resultUrlsRef = useRef<Set<string>>(new Set());
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
     return () => {
-      if (imageSrc) URL.revokeObjectURL(imageSrc);
-      if (resultUrl) URL.revokeObjectURL(resultUrl);
+      imageUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      resultUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
     };
-  }, [imageSrc, resultUrl]);
+  }, []);
 
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file || !file.type.startsWith('image/')) return;
-
-    if (imageSrc) URL.revokeObjectURL(imageSrc);
-    if (resultUrl) URL.revokeObjectURL(resultUrl);
-
-    setImageFile(file);
-    setImageSrc(URL.createObjectURL(file));
-    setImageDimensions(null);
-    setResultUrl('');
-    setResultSize(0);
+  const clearUrls = (urls: Set<string>) => {
+    urls.forEach((url) => URL.revokeObjectURL(url));
+    urls.clear();
   };
 
-  const handleImageLoad = () => {
-    const image = imageRef.current;
-    if (!image) return;
-
-    setImageDimensions(getOutputDimensions(image.naturalWidth, image.naturalHeight));
+  const reset = () => {
+    if (isProcessing) return;
+    clearUrls(imageUrlsRef.current);
+    clearUrls(resultUrlsRef.current);
+    setImageItems([]);
+    setResults([]);
+    setProgressIndex(0);
+    setErrorMessage('');
   };
 
-  const createPaddedImage = async () => {
-    const image = imageRef.current;
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []).filter((file) => file.type.startsWith('image/'));
+    if (files.length === 0 || isProcessing) return;
+
+    reset();
+    setIsLoadingImages(true);
+    setErrorMessage('');
+
+    try {
+      const items = await Promise.all(
+        files.map(async (file, index): Promise<ImageItem> => {
+          const src = URL.createObjectURL(file);
+          imageUrlsRef.current.add(src);
+          const image = await loadImage(src);
+          const dimensions = getOutputDimensions(image.naturalWidth, image.naturalHeight);
+
+          return {
+            id: `${file.name}-${file.lastModified}-${index}`,
+            file,
+            src,
+            width: dimensions.width,
+            height: dimensions.height,
+            outputHeight: dimensions.outputHeight,
+          };
+        }),
+      );
+
+      setImageItems(items);
+    } catch (error) {
+      console.error(error);
+      clearUrls(imageUrlsRef.current);
+      setImageItems([]);
+      setErrorMessage('일부 이미지를 읽을 수 없습니다. 다시 선택해 주세요.');
+    } finally {
+      setIsLoadingImages(false);
+      event.target.value = '';
+    }
+  };
+
+  const createPaddedImages = async () => {
     const canvas = canvasRef.current;
-    if (!image || !canvas || !imageDimensions || isProcessing) return;
+    if (!canvas || imageItems.length === 0 || isProcessing) return;
 
     setIsProcessing(true);
+    setProgressIndex(0);
+    setResults([]);
+    clearUrls(resultUrlsRef.current);
+    setErrorMessage('');
+
+    const nextResults: ImageResult[] = [];
+
     try {
-      canvas.width = imageDimensions.width;
-      canvas.height = imageDimensions.outputHeight;
       const context = canvas.getContext('2d');
       if (!context) throw new Error('Canvas를 사용할 수 없습니다.');
 
-      context.clearRect(0, 0, canvas.width, canvas.height);
-      if (background === 'white') {
-        context.fillStyle = '#ffffff';
-        context.fillRect(0, 0, canvas.width, canvas.height);
+      for (let index = 0; index < imageItems.length; index += 1) {
+        const item = imageItems[index];
+        setProgressIndex(index + 1);
+
+        const image = await loadImage(item.src);
+        canvas.width = item.width;
+        canvas.height = item.outputHeight;
+        context.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (background === 'white') {
+          context.fillStyle = '#ffffff';
+          context.fillRect(0, 0, canvas.width, canvas.height);
+        }
+
+        context.drawImage(image, 0, 0, item.width, item.height);
+        const blob = await canvasToBlob(canvas);
+        const url = URL.createObjectURL(blob);
+        resultUrlsRef.current.add(url);
+
+        const result: ImageResult = {
+          id: item.id,
+          fileName: item.file.name,
+          url,
+          size: blob.size,
+          width: item.width,
+          height: item.outputHeight,
+        };
+        nextResults.push(result);
+        setResults([...nextResults]);
+        onSuccess(blob.size);
       }
 
-      context.drawImage(image, 0, 0, imageDimensions.width, imageDimensions.height);
-      const blob = await canvasToBlob(canvas);
-      const nextResultUrl = URL.createObjectURL(blob);
-
-      if (resultUrl) URL.revokeObjectURL(resultUrl);
-      setResultUrl(nextResultUrl);
-      setResultSize(blob.size);
-      onSuccess(blob.size);
       confetti({ particleCount: 100, spread: 70, origin: { y: 0.8 } });
     } catch (error) {
       console.error(error);
-      alert('이미지 변환 중 오류가 발생했습니다.');
+      setErrorMessage('이미지 변환 중 오류가 발생했습니다. 완료된 결과는 다운로드할 수 있습니다.');
     } finally {
       setIsProcessing(false);
     }
   };
 
-  const reset = () => {
-    if (imageSrc) URL.revokeObjectURL(imageSrc);
-    if (resultUrl) URL.revokeObjectURL(resultUrl);
-    setImageFile(null);
-    setImageSrc('');
-    setImageDimensions(null);
-    setResultUrl('');
-    setResultSize(0);
-  };
-
-  const outputSize = imageDimensions
-    ? `${imageDimensions.width} × ${imageDimensions.outputHeight}px`
+  const firstItem = imageItems[0];
+  const outputLabel = firstItem
+    ? `${firstItem.width} × ${firstItem.outputHeight}px`
     : '원본을 선택하면 자동 계산됩니다';
-  const hasExtraHeight = imageDimensions && imageDimensions.outputHeight > imageDimensions.width * (16 / 9);
+  const hasExtraHeight = imageItems.some((item) => item.outputHeight > item.width * (16 / 9));
 
   return (
     <div className="space-y-8">
-      {!imageSrc ? (
+      {imageItems.length === 0 ? (
         <div className="flex flex-col items-center justify-center border-2 border-dashed border-purple-500/20 hover:border-purple-500/50 rounded-2xl p-12 bg-white/5 transition duration-300">
           <ImagePlus className="w-16 h-16 text-purple-400 mb-4 animate-pulse" />
-          <h3 className="text-xl font-medium mb-1">Upload Image</h3>
+          <h3 className="text-xl font-medium mb-1">Upload Images</h3>
           <p className="text-gray-400 text-sm mb-6 text-center max-w-sm">
-            이미지를 상단에 그대로 배치하고 아래 빈 공간을 추가해 9:16 PNG로 변환합니다.
+            여러 이미지를 한 번에 선택하면 원본을 상단에 배치하고 아래 빈 공간을 추가해 9:16 PNG로 일괄 변환합니다.
           </p>
           <label className="px-6 py-3 bg-purple-600 hover:bg-purple-700 font-medium rounded-xl cursor-pointer shadow-lg hover:shadow-purple-500/20 transition">
-            Choose Image File
-            <input type="file" accept="image/*" onChange={handleFileChange} className="hidden" />
+            Choose Image Files
+            <input type="file" accept="image/*" multiple onChange={handleFileChange} className="hidden" />
           </label>
+          {isLoadingImages && <p className="text-xs text-purple-300 mt-4">이미지 불러오는 중...</p>}
+          {errorMessage && <p className="text-xs text-red-300 mt-4">{errorMessage}</p>}
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
@@ -145,33 +217,38 @@ export const ImagePadding: React.FC<ImagePaddingProps> = ({ onSuccess }) => {
                 <span className="text-sm font-semibold px-2.5 py-1 bg-purple-500/10 text-purple-400 rounded-md border border-purple-500/20">
                   Step 1
                 </span>
-                <span className="font-medium text-gray-200">Original image at the top</span>
+                <span className="font-medium text-gray-200">{imageItems.length} files selected</span>
               </div>
               <button
                 onClick={reset}
-                className="text-xs text-purple-400 hover:text-purple-300 flex items-center space-x-1"
+                disabled={isProcessing}
+                className="text-xs text-purple-400 hover:text-purple-300 disabled:opacity-50 flex items-center space-x-1"
               >
                 <RefreshCw className="w-3 h-3" />
-                <span>Choose Another</span>
+                <span>Choose Again</span>
               </button>
             </div>
 
-            <div className="rounded-2xl overflow-hidden glass-panel select-none flex items-start justify-center bg-[#252733] p-4 min-h-[300px]">
-              <img
-                ref={imageRef}
-                src={imageSrc}
-                onLoad={handleImageLoad}
-                className="max-h-[500px] w-auto max-w-full object-contain"
-                alt="Uploaded original"
-              />
+            <div className="rounded-2xl overflow-hidden glass-panel p-4 min-h-[300px] max-h-[500px] overflow-y-auto">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                {imageItems.map((item) => (
+                  <div key={item.id} className="rounded-xl bg-[#252733] border border-white/10 p-2 space-y-2">
+                    <div className="aspect-square rounded-lg overflow-hidden bg-black/30 flex items-center justify-center">
+                      <img src={item.src} alt={item.file.name} className="max-h-full max-w-full object-contain" />
+                    </div>
+                    <p className="text-xs text-gray-300 truncate" title={item.file.name}>{item.file.name}</p>
+                    <p className="text-[10px] text-gray-500">{item.width} × {item.height}px</p>
+                  </div>
+                ))}
+              </div>
             </div>
             <div className="text-xs text-gray-500 flex justify-between px-1">
-              <span>Original: {imageDimensions ? `${imageDimensions.width} × ${imageDimensions.height}px` : 'Loading...'}</span>
-              <span>Output: {outputSize}</span>
+              <span>{imageItems.length}개 이미지 일괄 변환</span>
+              <span>Output: {outputLabel}</span>
             </div>
             {hasExtraHeight && (
               <p className="text-xs text-amber-300/80">
-                원본 높이가 9:16 캔버스보다 커서 원본이 잘리지 않도록 높이를 유지했습니다.
+                9:16 캔버스보다 큰 원본은 잘리지 않도록 원본 높이를 유지합니다.
               </p>
             )}
           </div>
@@ -189,21 +266,23 @@ export const ImagePadding: React.FC<ImagePaddingProps> = ({ onSuccess }) => {
                   <div className="grid grid-cols-2 gap-3">
                     <button
                       onClick={() => setBackground('transparent')}
+                      disabled={isProcessing}
                       className={`rounded-xl border px-3 py-2 text-sm transition ${
                         background === 'transparent'
                           ? 'border-purple-500 bg-purple-500/15 text-purple-300'
                           : 'border-white/10 bg-white/5 text-gray-400 hover:text-gray-200'
-                      }`}
+                      } disabled:opacity-50`}
                     >
                       Transparent
                     </button>
                     <button
                       onClick={() => setBackground('white')}
+                      disabled={isProcessing}
                       className={`rounded-xl border px-3 py-2 text-sm transition ${
                         background === 'white'
                           ? 'border-purple-500 bg-purple-500/15 text-purple-300'
                           : 'border-white/10 bg-white/5 text-gray-400 hover:text-gray-200'
-                      }`}
+                      } disabled:opacity-50`}
                     >
                       White
                     </button>
@@ -215,54 +294,64 @@ export const ImagePadding: React.FC<ImagePaddingProps> = ({ onSuccess }) => {
 
                 <div className="rounded-xl bg-white/5 border border-white/10 p-4 space-y-2">
                   <div className="flex justify-between text-sm">
-                    <span className="text-gray-400">Canvas size</span>
-                    <span className="text-purple-300 font-mono">{outputSize}</span>
+                    <span className="text-gray-400">Selected files</span>
+                    <span className="text-purple-300 font-mono">{imageItems.length}</span>
                   </div>
-                  <p className="text-xs text-gray-500">원본은 가로 폭을 유지하고 캔버스의 가장 위에 배치됩니다.</p>
+                  <p className="text-xs text-gray-500">모든 이미지는 원본 가로 폭을 유지하고 캔버스의 가장 위에 배치됩니다.</p>
                 </div>
               </div>
 
               {isProcessing ? (
-                <div className="w-full py-4 bg-[#121318] border border-white/10 rounded-xl flex items-center justify-center space-x-3 text-purple-400 font-medium">
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                  <span>Creating 9:16 Image...</span>
+                <div className="w-full py-4 bg-[#121318] border border-white/10 rounded-xl flex flex-col items-center justify-center space-y-2 text-purple-400 font-medium">
+                  <div className="flex items-center space-x-3">
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                    <span>Creating {progressIndex}/{imageItems.length}...</span>
+                  </div>
+                  <span className="text-xs text-gray-400">브라우저에서 순차 처리 중</span>
                 </div>
               ) : (
                 <button
-                  onClick={createPaddedImage}
-                  disabled={!imageDimensions}
+                  onClick={createPaddedImages}
+                  disabled={isLoadingImages || imageItems.length === 0}
                   className="w-full py-4 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 font-medium rounded-xl shadow-lg shadow-purple-500/10 hover:shadow-purple-500/25 disabled:opacity-50 disabled:cursor-not-allowed transition duration-300 flex items-center justify-center space-x-2"
                 >
                   <Sparkles className="w-5 h-5 animate-pulse" />
-                  <span>Make 9:16 Image</span>
+                  <span>Make {imageItems.length} Image{imageItems.length > 1 ? 's' : ''}</span>
                 </button>
               )}
             </div>
 
-            {resultUrl && (
+            {results.length > 0 && (
               <div className="glass-panel rounded-2xl p-6 space-y-4 border border-green-500/20">
                 <div className="flex justify-between items-center">
                   <span className="text-sm font-semibold text-green-400 flex items-center space-x-1.5">
                     <AlertCircle className="w-4 h-4" />
-                    <span>9:16 Image Ready!</span>
-                  </span>
-                  <span className="text-xs font-mono text-gray-400 bg-white/5 px-2 py-0.5 rounded">
-                    {formatBytes(resultSize)}
+                    <span>{results.length}/{imageItems.length} Images Ready!</span>
                   </span>
                 </div>
-                <div className="rounded-xl overflow-hidden bg-black/40 p-2 flex justify-center border border-white/5 max-h-[300px]">
-                  <img src={resultUrl} alt="9:16 result" className="max-h-[280px] object-contain rounded" />
+                <div className="space-y-3 max-h-[420px] overflow-y-auto pr-1">
+                  {results.map((result) => (
+                    <div key={result.id} className="flex items-center gap-3 rounded-xl bg-black/30 border border-white/5 p-2">
+                      <img src={result.url} alt={`9:16 ${result.fileName}`} className="w-12 h-16 object-contain rounded bg-white/5" />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs text-gray-300 truncate" title={result.fileName}>{result.fileName}</p>
+                        <p className="text-[10px] text-gray-500">{result.width} × {result.height}px · {formatBytes(result.size)}</p>
+                      </div>
+                      <a
+                        href={result.url}
+                        download={getOutputFileName(result.fileName)}
+                        className="shrink-0 p-2 rounded-lg bg-green-600 hover:bg-green-500 transition"
+                        aria-label={`${result.fileName} 다운로드`}
+                        title="Download PNG"
+                      >
+                        <Download className="w-4 h-4" />
+                      </a>
+                    </div>
+                  ))}
                 </div>
-                <a
-                  href={resultUrl}
-                  download={`9x16_${imageFile?.name.replace(/\.[^.]+$/, '') || 'image'}.png`}
-                  className="w-full py-3.5 bg-green-600 hover:bg-green-500 font-medium rounded-xl text-center flex items-center justify-center space-x-2 shadow-lg shadow-green-500/10 hover:shadow-green-500/20 transition"
-                >
-                  <Download className="w-5 h-5" />
-                  <span>Download PNG</span>
-                </a>
               </div>
             )}
+            {errorMessage && <p className="text-xs text-red-300">{errorMessage}</p>}
           </div>
         </div>
       )}
