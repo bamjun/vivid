@@ -1,247 +1,397 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { formatBytes } from '@/lib/utils';
 import { fetchFile } from '@ffmpeg/util';
 import { Film, Download, Sparkles, AlertCircle, RefreshCw, Loader2 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { CropOverlay } from './CropOverlay';
 import ffmpeg, { loadFFmpeg as initFFmpeg } from '@/lib/ffmpeg';
+
 interface VideoToGifProps {
   onSuccess: (size: number) => void;
 }
 
-export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
-  const [videoFile, setVideoFile] = useState<File | null>(null);
-  const [videoSrc, setVideoSrc] = useState<string>('');
-  const [videoDuration, setVideoDuration] = useState<number>(0);
-  const [videoWidth, setVideoWidth] = useState<number>(0);
-  const [videoHeight, setVideoHeight] = useState<number>(0);
+interface VideoItem {
+  id: string;
+  file: File;
+  src: string;
+  width: number;
+  height: number;
+  duration: number;
+}
 
-  // Settings
+interface GifResult {
+  id: string;
+  fileName: string;
+  url: string;
+  size: number;
+  width: number;
+  height: number;
+}
+
+interface CropArea {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+const loadVideoMetadata = (src: string): Promise<HTMLVideoElement> =>
+  new Promise((resolve, reject) => {
+    const video = document.createElement('video');
+    video.preload = 'metadata';
+    video.onloadedmetadata = () => resolve(video);
+    video.onerror = () => reject(new Error('영상을 읽을 수 없습니다.'));
+    video.src = src;
+    video.load();
+  });
+
+const getGifFileName = (fileName: string) =>
+  `${fileName.replace(/\.[^.]+$/, '') || 'converted'}.gif`;
+
+export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
+  const [videoItems, setVideoItems] = useState<VideoItem[]>([]);
   const [startTime, setStartTime] = useState<number>(0);
   const [endTime, setEndTime] = useState<number>(0);
   const [fps, setFps] = useState<number>(12);
-  const [scale, setScale] = useState<number>(0.75); // higher default scale for better resolution
-  const [dither, setDither] = useState<string>('bayer'); // bayer, floyd_steinberg, none
-
-  // Processing states
+  const [scale, setScale] = useState<number>(0.75);
+  const [dither, setDither] = useState<string>('bayer');
+  const [outputWidth, setOutputWidth] = useState<string>('');
+  const [outputHeight, setOutputHeight] = useState<string>('');
   const [isWasmLoading, setIsWasmLoading] = useState<boolean>(false);
+  const [isLoadingVideos, setIsLoadingVideos] = useState<boolean>(false);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [progressMsg, setProgressMsg] = useState<string>('');
-  const [gifResult, setGifResult] = useState<string>('');
-  const [gifSize, setGifSize] = useState<number>(0);
-
-  // Crop State
-  const [crop, setCrop] = useState({ x: 0, y: 0, width: 0, height: 0 });
+  const [progressIndex, setProgressIndex] = useState<number>(0);
+  const [results, setResults] = useState<GifResult[]>([]);
+  const [errorMessage, setErrorMessage] = useState<string>('');
+  const [crop, setCrop] = useState<CropArea>({ x: 0, y: 0, width: 0, height: 0 });
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const inputUrlsRef = useRef<Set<string>>(new Set());
+  const resultUrlsRef = useRef<Set<string>>(new Set());
 
-  // Cleanup Object URL on unmount
   useEffect(() => {
     return () => {
-      if (videoSrc) URL.revokeObjectURL(videoSrc);
-      if (gifResult) URL.revokeObjectURL(gifResult);
+      inputUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+      resultUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
     };
-  }, [videoSrc, gifResult]);
+  }, []);
+
+  const clearUrls = (urls: Set<string>) => {
+    urls.forEach((url) => URL.revokeObjectURL(url));
+    urls.clear();
+  };
 
   const loadFFmpeg = async () => {
+    if (ffmpeg.loaded) return;
+
     setIsWasmLoading(true);
+    setProgressMsg('Loading FFmpeg WebAssembly...');
     try {
       await initFFmpeg(
         (msg) => setProgressMsg(msg),
-        () => {}
+        () => {},
       );
-    } catch (err: any) {
-      console.error('Failed to load FFmpeg WASM', err);
-      alert(`Failed to load FFmpeg: ${err?.message || err}. Please ensure the Vite server was restarted to apply Cross-Origin Isolation headers.`);
+    } catch (error: unknown) {
+      console.error('Failed to load FFmpeg WASM', error);
+      const message = error instanceof Error ? error.message : String(error);
+      alert(`Failed to load FFmpeg: ${message}. Please ensure the Vite server was restarted to apply Cross-Origin Isolation headers.`);
     } finally {
       setIsWasmLoading(false);
     }
   };
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    setVideoFile(file);
-    const url = URL.createObjectURL(file);
-    setVideoSrc(url);
-    setGifResult('');
-    setGifSize(0);
-
-    // Eager load FFmpeg when a file is selected
-    await loadFFmpeg();
+  const reset = () => {
+    if (isProcessing) return;
+    clearUrls(inputUrlsRef.current);
+    clearUrls(resultUrlsRef.current);
+    setVideoItems([]);
+    setResults([]);
+    setOutputWidth('');
+    setOutputHeight('');
+    setStartTime(0);
+    setEndTime(0);
+    setProgressIndex(0);
+    setProgressMsg('');
+    setErrorMessage('');
+    setCrop({ x: 0, y: 0, width: 0, height: 0 });
   };
 
-  const handleLoadedMetadata = () => {
-    const video = videoRef.current;
-    if (!video) return;
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []).filter((file) => file.type.startsWith('video/'));
+    if (files.length === 0 || isProcessing) return;
 
-    setVideoDuration(video.duration);
-    setEndTime(Math.min(video.duration, 4)); // default to first 4 seconds
-    setVideoWidth(video.videoWidth);
-    setVideoHeight(video.videoHeight);
+    reset();
+    setIsLoadingVideos(true);
+    setErrorMessage('');
 
-    // Initial Crop (full screen)
-    setCrop({
-      x: 0,
-      y: 0,
-      width: video.videoWidth,
-      height: video.videoHeight,
-    });
+    try {
+      const items = await Promise.all(
+        files.map(async (file, index): Promise<VideoItem> => {
+          const src = URL.createObjectURL(file);
+          inputUrlsRef.current.add(src);
+          const metadataVideo = await loadVideoMetadata(src);
+
+          return {
+            id: `${file.name}-${file.lastModified}-${index}`,
+            file,
+            src,
+            width: metadataVideo.videoWidth,
+            height: metadataVideo.videoHeight,
+            duration: metadataVideo.duration,
+          };
+        }),
+      );
+
+      const firstVideo = items[0];
+      const defaultEnd = Math.min(firstVideo.duration, 4);
+      setVideoItems(items);
+      setStartTime(0);
+      setEndTime(defaultEnd);
+      setCrop({ x: 0, y: 0, width: firstVideo.width, height: firstVideo.height });
+      setOutputWidth(String(Math.max(1, Math.round(firstVideo.width * scale))));
+      setOutputHeight(String(Math.max(1, Math.round(firstVideo.height * scale))));
+      await loadFFmpeg();
+    } catch (error: unknown) {
+      console.error(error);
+      clearUrls(inputUrlsRef.current);
+      setVideoItems([]);
+      setErrorMessage('일부 영상을 읽을 수 없습니다. MP4 파일을 다시 선택해 주세요.');
+    } finally {
+      setIsLoadingVideos(false);
+      event.target.value = '';
+    }
+  };
+
+  const handleScaleChange = (nextScale: number) => {
+    setScale(nextScale);
+    const baseWidth = videoItems.length === 1 ? crop.width : videoItems[0]?.width ?? 0;
+    const baseHeight = videoItems.length === 1 ? crop.height : videoItems[0]?.height ?? 0;
+    if (baseWidth > 0 && baseHeight > 0) {
+      setOutputWidth(String(Math.max(1, Math.round(baseWidth * nextScale))));
+      setOutputHeight(String(Math.max(1, Math.round(baseHeight * nextScale))));
+    }
+  };
+
+  const resetCrop = () => {
+    const firstVideo = videoItems[0];
+    if (!firstVideo) return;
+
+    setCrop({ x: 0, y: 0, width: firstVideo.width, height: firstVideo.height });
+    setOutputWidth(String(Math.max(1, Math.round(firstVideo.width * scale))));
+    setOutputHeight(String(Math.max(1, Math.round(firstVideo.height * scale))));
+  };
+
+  const updateCropField = (field: keyof CropArea, value: string) => {
+    const firstVideo = videoItems[0];
+    if (!firstVideo) return;
+
+    const numericValue = Number(value);
+    if (!Number.isFinite(numericValue)) return;
+
+    const next = { ...crop, [field]: Math.round(numericValue) };
+    next.width = Math.max(1, Math.min(next.width, firstVideo.width));
+    next.height = Math.max(1, Math.min(next.height, firstVideo.height));
+    next.x = Math.max(0, Math.min(next.x, firstVideo.width - next.width));
+    next.y = Math.max(0, Math.min(next.y, firstVideo.height - next.height));
+    setCrop(next);
+  };
+
+  const safeDelete = async (fileName: string) => {
+    try {
+      await ffmpeg.deleteFile(fileName);
+    } catch {
+      // The file may not have been created if FFmpeg failed early.
+    }
   };
 
   const convertToGif = async () => {
-    if (!videoFile || !videoRef.current || isProcessing) return;
-    
-    // Ensure FFmpeg is fully loaded
+    if (videoItems.length === 0 || isProcessing) return;
+
+    const targetWidth = Number(outputWidth);
+    const targetHeight = Number(outputHeight);
+    if (!Number.isInteger(targetWidth) || targetWidth < 1 || !Number.isInteger(targetHeight) || targetHeight < 1) {
+      setErrorMessage('출력 가로와 세로를 1 이상의 정수로 입력해 주세요.');
+      return;
+    }
+
     if (!ffmpeg.loaded) {
       await loadFFmpeg();
     }
+    if (!ffmpeg.loaded) return;
 
     setIsProcessing(true);
-    setGifResult('');
+    setProgressIndex(0);
+    setResults([]);
+    clearUrls(resultUrlsRef.current);
+    setErrorMessage('');
 
-    const targetW = Math.round(crop.width * scale);
-    const targetH = Math.round(crop.height * scale);
+    const nextResults: GifResult[] = [];
 
     try {
-      // 1. Write the source video file to FFmpeg WASM virtual filesystem
-      setProgressMsg('Step 1/3: Reading video file...');
-      const videoData = await fetchFile(videoFile);
-      await ffmpeg.writeFile('input.mp4', videoData);
+      for (let index = 0; index < videoItems.length; index += 1) {
+        const item = videoItems[index];
+        const inputName = `input-${index}.mp4`;
+        const paletteName = `palette-${index}.png`;
+        const outputName = `output-${index}.gif`;
+        const effectiveStart = Math.max(0, Math.min(startTime, Math.max(0, item.duration - 0.1)));
+        const effectiveEnd = Math.min(Math.max(effectiveStart + 0.1, endTime), item.duration);
+        const duration = Math.max(0.1, effectiveEnd - effectiveStart);
+        const cropFilter = videoItems.length === 1
+          ? `crop=${Math.round(crop.width)}:${Math.round(crop.height)}:${Math.round(crop.x)}:${Math.round(crop.y)}`
+          : `crop=${item.width}:${item.height}:0:0`;
+        const filterString = `${cropFilter},scale=${targetWidth}:${targetHeight}:flags=lanczos,fps=${fps}`;
+        const ditherConfig = dither === 'none' ? 'dither=none' : `dither=${dither}`;
 
-      // FFmpeg filter string representing cropping and scaling operations
-      const filterString = `crop=${crop.width}:${crop.height}:${crop.x}:${crop.y},scale=${targetW}:${targetH},fps=${fps}`;
+        setProgressIndex(index + 1);
+        setProgressMsg(`${index + 1}/${videoItems.length} 파일 변환 중...`);
 
-      // 2. Pass 1: Generate high quality 256-color palette specifically for the video contents
-      setProgressMsg('Step 2/3: Generating high-fidelity color palette (Pass 1)...');
-      await ffmpeg.exec([
-        '-ss', startTime.toString(),
-        '-to', endTime.toString(),
-        '-i', 'input.mp4',
-        '-vf', `${filterString},palettegen=stats_mode=diff`,
-        'palette.png',
-      ]);
+        try {
+          setProgressMsg(`${index + 1}/${videoItems.length} 파일 읽는 중...`);
+          const videoData = await fetchFile(item.file);
+          await ffmpeg.writeFile(inputName, videoData);
 
-      // 3. Pass 2: Compile video to GIF utilizing the custom generated palette and dithering
-      setProgressMsg('Step 3/3: Rendering professional quality GIF (Pass 2)...');
-      const ditherConfig = dither === 'none' ? 'dither=none' : `dither=${dither}`;
-      
-      await ffmpeg.exec([
-        '-ss', startTime.toString(),
-        '-to', endTime.toString(),
-        '-i', 'input.mp4',
-        '-i', 'palette.png',
-        '-filter_complex', `[0:v]${filterString}[v];[v][1:v]paletteuse=${ditherConfig}`,
-        'output.gif',
-      ]);
+          setProgressMsg(`${index + 1}/${videoItems.length} 색상 팔레트 생성 중...`);
+          await ffmpeg.exec([
+            '-y',
+            '-ss', effectiveStart.toString(),
+            '-t', duration.toString(),
+            '-i', inputName,
+            '-vf', `${filterString},palettegen=stats_mode=diff`,
+            paletteName,
+          ]);
 
-      // 4. Read output gif from FFmpeg filesystem
-      setProgressMsg('Finalizing...');
-      const data = await ffmpeg.readFile('output.gif');
-      const gifBlob = new Blob([data as any], { type: 'image/gif' });
-      const gifUrl = URL.createObjectURL(gifBlob);
+          setProgressMsg(`${index + 1}/${videoItems.length} GIF 렌더링 중...`);
+          await ffmpeg.exec([
+            '-y',
+            '-ss', effectiveStart.toString(),
+            '-t', duration.toString(),
+            '-i', inputName,
+            '-i', paletteName,
+            '-filter_complex', `[0:v]${filterString}[v];[v][1:v]paletteuse=${ditherConfig}`,
+            outputName,
+          ]);
 
-      setGifResult(gifUrl);
-      setGifSize(gifBlob.size);
-      onSuccess(gifBlob.size);
+          const data = await ffmpeg.readFile(outputName);
+          const gifBlob = new Blob([data as BlobPart], { type: 'image/gif' });
+          const url = URL.createObjectURL(gifBlob);
+          resultUrlsRef.current.add(url);
 
-      // Clean up local virtual files to save memory
-      await ffmpeg.deleteFile('input.mp4');
-      await ffmpeg.deleteFile('palette.png');
-      await ffmpeg.deleteFile('output.gif');
+          const result: GifResult = {
+            id: item.id,
+            fileName: item.file.name,
+            url,
+            size: gifBlob.size,
+            width: targetWidth,
+            height: targetHeight,
+          };
+          nextResults.push(result);
+          setResults([...nextResults]);
+          onSuccess(gifBlob.size);
+        } finally {
+          await safeDelete(inputName);
+          await safeDelete(paletteName);
+          await safeDelete(outputName);
+        }
+      }
 
-      // Celebration
-      confetti({
-        particleCount: 100,
-        spread: 70,
-        origin: { y: 0.8 },
-      });
-    } catch (err) {
-      console.error(err);
-      alert('Error during conversion. Check console.');
+      confetti({ particleCount: 100, spread: 70, origin: { y: 0.8 } });
+    } catch (error) {
+      console.error(error);
+      setErrorMessage('GIF 변환 중 오류가 발생했습니다. 완료된 결과는 다운로드할 수 있습니다.');
     } finally {
       setIsProcessing(false);
       setProgressMsg('');
     }
   };
 
-  const resetCrop = () => {
-    setCrop({
-      x: 0,
-      y: 0,
-      width: videoWidth,
-      height: videoHeight,
-    });
-  };
+  const firstVideo = videoItems[0];
+  const isBatch = videoItems.length > 1;
+  const hasValidDimensions = Number(outputWidth) >= 1 && Number(outputHeight) >= 1;
 
   return (
     <div className="space-y-8">
-      {/* File Selector */}
-      {!videoSrc ? (
+      {!firstVideo ? (
         <div className="flex flex-col items-center justify-center border-2 border-dashed border-purple-500/20 hover:border-purple-500/50 rounded-2xl p-12 bg-white/5 transition duration-300">
           <Film className="w-16 h-16 text-purple-400 mb-4 animate-pulse" />
-          <h3 className="text-xl font-medium mb-1">Upload MP4 Video</h3>
-          <p className="text-gray-400 text-sm mb-6 text-center max-w-xs">
-            Select a video file to convert to a high-quality GIF using client-side FFmpeg WebAssembly.
+          <h3 className="text-xl font-medium mb-1">Upload MP4 Videos</h3>
+          <p className="text-gray-400 text-sm mb-6 text-center max-w-sm">
+            여러 MP4를 한 번에 선택해 같은 설정과 출력 크기로 GIF로 일괄 변환합니다.
           </p>
           <label className="px-6 py-3 bg-purple-600 hover:bg-purple-700 font-medium rounded-xl cursor-pointer shadow-lg hover:shadow-purple-500/20 transition">
-            Choose Video File
-            <input type="file" accept="video/mp4" onChange={handleFileChange} className="hidden" />
+            Choose Video Files
+            <input type="file" accept="video/mp4,video/*" multiple onChange={handleFileChange} className="hidden" />
           </label>
+          {isLoadingVideos && <p className="text-xs text-purple-300 mt-4">영상 메타데이터 불러오는 중...</p>}
+          {errorMessage && <p className="text-xs text-red-300 mt-4">{errorMessage}</p>}
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-          {/* Left Column - Video Preview & Cropper */}
           <div className="lg:col-span-7 space-y-4">
             <div className="flex justify-between items-center">
               <div className="flex items-center space-x-2">
                 <span className="text-sm font-semibold px-2.5 py-1 bg-purple-500/10 text-purple-400 rounded-md border border-purple-500/20">
                   Step 1
                 </span>
-                <span className="font-medium text-gray-200">Adjust borders/drag box to crop video</span>
+                <span className="font-medium text-gray-200">{videoItems.length} files selected</span>
               </div>
-              <button 
-                onClick={resetCrop}
-                className="text-xs text-purple-400 hover:text-purple-300 flex items-center space-x-1"
+              <button
+                onClick={reset}
+                disabled={isProcessing}
+                className="text-xs text-purple-400 hover:text-purple-300 disabled:opacity-50 flex items-center space-x-1"
               >
                 <RefreshCw className="w-3 h-3" />
-                <span>Reset Crop</span>
+                <span>Choose Again</span>
               </button>
             </div>
 
-            {/* Video Container with New CropOverlay */}
-            <div 
-              className="relative rounded-2xl overflow-hidden glass-panel select-none flex items-center justify-center bg-black"
-              style={{ minHeight: '300px' }}
-            >
-              <video
-                ref={videoRef}
-                src={videoSrc}
-                onLoadedMetadata={handleLoadedMetadata}
-                className="max-h-[500px] w-auto max-w-full relative z-0"
-                controls
-                playsInline
-              />
-
-              {/* CropOverlay Wrapper */}
-              {videoWidth > 0 && (
-                <CropOverlay
-                  mediaWidth={videoWidth}
-                  mediaHeight={videoHeight}
-                  crop={crop}
-                  setCrop={setCrop}
-                  mediaRef={videoRef}
-                />
-              )}
-            </div>
-            <div className="text-xs text-gray-500 flex justify-between px-1">
-              <span>Original size: {videoWidth}x{videoHeight}</span>
-              <span>Crop: X:{crop.x}, Y:{crop.y}, {crop.width}x{crop.height}</span>
-            </div>
+            {isBatch ? (
+              <div className="rounded-2xl overflow-hidden glass-panel p-4 min-h-[300px] max-h-[500px] overflow-y-auto">
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                  {videoItems.map((item) => (
+                    <div key={item.id} className="rounded-xl bg-[#252733] border border-white/10 p-2 space-y-2">
+                      <div className="aspect-video rounded-lg overflow-hidden bg-black/30 flex items-center justify-center">
+                        <video src={item.src} muted playsInline preload="metadata" className="max-h-full max-w-full object-contain" />
+                      </div>
+                      <p className="text-xs text-gray-300 truncate" title={item.file.name}>{item.file.name}</p>
+                      <p className="text-[10px] text-gray-500">{item.width} × {item.height}px · {item.duration.toFixed(1)}s</p>
+                    </div>
+                  ))}
+                </div>
+                <p className="text-xs text-purple-300/80 mt-4">다중 변환은 각 영상 전체 화면을 사용합니다.</p>
+              </div>
+            ) : (
+              <>
+                <div className="relative rounded-2xl overflow-hidden glass-panel select-none flex items-center justify-center bg-black" style={{ minHeight: '300px' }}>
+                  <video
+                    ref={videoRef}
+                    src={firstVideo.src}
+                    className="max-h-[500px] w-auto max-w-full relative z-0"
+                    controls
+                    playsInline
+                  />
+                  {firstVideo.width > 0 && (
+                    <CropOverlay
+                      mediaWidth={firstVideo.width}
+                      mediaHeight={firstVideo.height}
+                      crop={crop}
+                      setCrop={setCrop}
+                      mediaRef={videoRef}
+                    />
+                  )}
+                </div>
+                <div className="text-xs text-gray-500 flex justify-between px-1">
+                  <span>Original size: {firstVideo.width}x{firstVideo.height}</span>
+                  <span>Crop: X:{crop.x}, Y:{crop.y}, {crop.width}x{crop.height}</span>
+                </div>
+                <button onClick={resetCrop} className="text-xs text-purple-400 hover:text-purple-300 flex items-center space-x-1">
+                  <RefreshCw className="w-3 h-3" />
+                  <span>Reset Crop & Output Size</span>
+                </button>
+              </>
+            )}
           </div>
 
-          {/* Right Column - Custom Controls */}
           <div className="lg:col-span-5 space-y-6">
             <div className="glass-panel-glow rounded-2xl p-6 space-y-6">
               <h3 className="text-lg font-semibold flex items-center space-x-2 border-b border-white/5 pb-3">
@@ -249,23 +399,19 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
                 <span>Conversion Settings (FFmpeg)</span>
               </h3>
 
-              {/* Settings Inputs */}
               <div className="space-y-5">
-                {/* Trim Range Slider / Inputs */}
                 <div>
-                  <label className="block text-xs font-semibold uppercase text-gray-400 mb-2">
-                    Trim Duration
-                  </label>
+                  <label className="block text-xs font-semibold uppercase text-gray-400 mb-2">Trim Duration</label>
                   <div className="grid grid-cols-2 gap-4">
                     <div>
                       <span className="text-xs text-gray-500 block mb-1">Start Time (sec)</span>
                       <input
                         type="number"
                         min={0}
-                        max={videoDuration}
+                        max={Math.max(0, firstVideo.duration)}
                         step={0.1}
                         value={startTime}
-                        onChange={(e) => setStartTime(Math.max(0, Math.min(Number(e.target.value), endTime)))}
+                        onChange={(event) => setStartTime(Math.max(0, Math.min(Number(event.target.value), endTime)))}
                         className="w-full bg-[#121318] border border-white/10 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition"
                       />
                     </div>
@@ -274,132 +420,211 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
                       <input
                         type="number"
                         min={startTime}
-                        max={videoDuration}
+                        max={Math.max(startTime, firstVideo.duration)}
                         step={0.1}
                         value={endTime}
-                        onChange={(e) => setEndTime(Math.max(startTime, Math.min(Number(e.target.value), videoDuration)))}
+                        onChange={(event) => setEndTime(Math.max(startTime, Math.min(Number(event.target.value), Math.max(startTime, firstVideo.duration))))}
                         className="w-full bg-[#121318] border border-white/10 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition"
                       />
                     </div>
                   </div>
-                  <div className="text-[11px] text-gray-500 mt-2">
-                    Total duration: {(endTime - startTime).toFixed(1)}s (Video length: {videoDuration.toFixed(1)}s)
-                  </div>
+                  {isBatch && <span className="text-[10px] text-gray-500 block mt-2">각 영상의 길이에 맞춰 자동으로 조정됩니다.</span>}
                 </div>
 
-                {/* Scale Slider */}
+                <div>
+                  <label className="block text-xs font-semibold uppercase text-gray-400 mb-2">Crop Area (source px)</label>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <span className="text-xs text-gray-500 block mb-1">X</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={Math.max(0, firstVideo.width - crop.width)}
+                        step={1}
+                        value={crop.x}
+                        onChange={(event) => updateCropField('x', event.target.value)}
+                        disabled={isBatch || isProcessing}
+                        className="w-full bg-[#121318] border border-purple-500/30 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition disabled:opacity-50"
+                      />
+                    </div>
+                    <div>
+                      <span className="text-xs text-gray-500 block mb-1">Y</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={Math.max(0, firstVideo.height - crop.height)}
+                        step={1}
+                        value={crop.y}
+                        onChange={(event) => updateCropField('y', event.target.value)}
+                        disabled={isBatch || isProcessing}
+                        className="w-full bg-[#121318] border border-purple-500/30 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition disabled:opacity-50"
+                      />
+                    </div>
+                    <div>
+                      <span className="text-xs text-gray-500 block mb-1">Crop Width</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={firstVideo.width}
+                        step={1}
+                        value={crop.width}
+                        onChange={(event) => updateCropField('width', event.target.value)}
+                        disabled={isBatch || isProcessing}
+                        className="w-full bg-[#121318] border border-purple-500/30 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition disabled:opacity-50"
+                      />
+                    </div>
+                    <div>
+                      <span className="text-xs text-gray-500 block mb-1">Crop Height</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={firstVideo.height}
+                        step={1}
+                        value={crop.height}
+                        onChange={(event) => updateCropField('height', event.target.value)}
+                        disabled={isBatch || isProcessing}
+                        className="w-full bg-[#121318] border border-purple-500/30 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition disabled:opacity-50"
+                      />
+                    </div>
+                  </div>
+                  <span className="text-[10px] text-purple-300 block mt-2">드래그하거나 값을 입력하면 Crop X/Y/Width/Height가 서로 동기화됩니다.</span>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold uppercase text-gray-400 mb-2">Output Size (px)</label>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <span className="text-xs text-gray-500 block mb-1">Width</span>
+                      <input
+                        type="number"
+                        min={1}
+                        step={1}
+                        inputMode="numeric"
+                        value={outputWidth}
+                        onChange={(event) => setOutputWidth(event.target.value.replace(/[^0-9]/g, ''))}
+                        className="w-full bg-[#121318] border border-purple-500/30 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition"
+                        placeholder="예: 360"
+                      />
+                    </div>
+                    <div>
+                      <span className="text-xs text-gray-500 block mb-1">Height</span>
+                      <input
+                        type="number"
+                        min={1}
+                        step={1}
+                        inputMode="numeric"
+                        value={outputHeight}
+                        onChange={(event) => setOutputHeight(event.target.value.replace(/[^0-9]/g, ''))}
+                        className="w-full bg-[#121318] border border-purple-500/30 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition"
+                        placeholder="예: 640"
+                      />
+                    </div>
+                  </div>
+                  <span className="text-[10px] text-purple-300 block mt-2">입력한 가로·세로 크기가 모든 GIF에 적용됩니다.</span>
+                </div>
+
                 <div>
                   <div className="flex justify-between mb-1">
-                    <label className="text-xs font-semibold uppercase text-gray-400">Scale (Output Resolution)</label>
+                    <label className="text-xs font-semibold uppercase text-gray-400">Scale Preset</label>
                     <span className="text-xs font-mono text-purple-400">{Math.round(scale * 100)}%</span>
                   </div>
                   <input
                     type="range"
                     min={0.1}
-                    max={1}
+                    max={1.5}
                     step={0.05}
                     value={scale}
-                    onChange={(e) => setScale(Number(e.target.value))}
-                    className="w-full accent-purple-500 bg-white/5 h-1.5 rounded-lg appearance-none cursor-pointer"
+                    onChange={(event) => handleScaleChange(Number(event.target.value))}
+                    disabled={isProcessing}
+                    className="w-full accent-purple-500 bg-white/5 h-1.5 rounded-lg appearance-none cursor-pointer disabled:opacity-50"
                   />
-                  <span className="text-[10px] text-gray-500 block mt-1">
-                    Output GIF Size: {Math.round(crop.width * scale)}x{Math.round(crop.height * scale)} px
-                  </span>
+                  <span className="text-[10px] text-gray-500 block mt-1">슬라이더는 출력 가로·세로 값을 한 번에 조정합니다.</span>
                 </div>
 
-                {/* FPS Selector */}
                 <div>
-                  <div className="flex justify-between mb-1">
-                    <label className="text-xs font-semibold uppercase text-gray-400">Frame Rate (FPS)</label>
-                    <span className="text-xs font-mono text-purple-400">{fps} FPS</span>
-                  </div>
+                  <label className="block text-xs font-semibold uppercase text-gray-400 mb-2">Frame Rate (FPS)</label>
                   <input
-                    type="range"
-                    min={5}
-                    max={25}
+                    type="number"
+                    min={1}
+                    max={30}
                     step={1}
                     value={fps}
-                    onChange={(e) => setFps(Number(e.target.value))}
-                    className="w-full accent-purple-500 bg-white/5 h-1.5 rounded-lg appearance-none cursor-pointer"
+                    onChange={(event) => setFps(Math.max(1, Math.min(30, Number(event.target.value))))}
+                    className="w-full bg-[#121318] border border-white/10 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition"
                   />
-                  <span className="text-[10px] text-gray-500 block mt-1">
-                    Higher FPS yields smoother results but larger file size.
-                  </span>
                 </div>
 
-                {/* Dithering Mode */}
                 <div>
-                  <label className="block text-xs font-semibold uppercase text-gray-400 mb-2">
-                    Dithering Method (Color blending)
-                  </label>
+                  <label className="block text-xs font-semibold uppercase text-gray-400 mb-2">Dithering Method</label>
                   <select
                     value={dither}
-                    onChange={(e) => setDither(e.target.value)}
-                    className="w-full bg-[#121318] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-gray-200 focus:outline-none focus:border-purple-500 transition"
+                    onChange={(event) => setDither(event.target.value)}
+                    disabled={isProcessing}
+                    className="w-full bg-[#121318] border border-white/10 rounded-xl px-4 py-2.5 text-sm text-gray-200 focus:outline-none focus:border-purple-500 transition disabled:opacity-50"
                   >
-                    <option value="bayer">Bayer (Dithered patterns - recommended)</option>
-                    <option value="floyd_steinberg">Floyd-Steinberg (Diffusion - premium smooth)</option>
-                    <option value="none">None (Clean colors, sharp edges)</option>
+                    <option value="bayer">Bayer (Recommended)</option>
+                    <option value="floyd_steinberg">Floyd-Steinberg (Smooth)</option>
+                    <option value="none">None (Sharp)</option>
                   </select>
-                  <span className="text-[10px] text-gray-500 block mt-1">
-                    Floyd-Steinberg reduces color bands on gradients. Bayer produces smaller file sizes.
-                  </span>
                 </div>
               </div>
 
-              {/* Action Button */}
               {isWasmLoading ? (
                 <div className="w-full py-4 bg-[#121318] border border-white/10 rounded-xl flex items-center justify-center space-x-3 text-purple-400 font-medium">
                   <Loader2 className="w-5 h-5 animate-spin" />
                   <span>Loading FFmpeg WebAssembly...</span>
                 </div>
-              ) : !isProcessing ? (
+              ) : isProcessing ? (
+                <div className="w-full py-4 bg-[#121318] border border-white/10 rounded-xl flex flex-col items-center justify-center space-y-2 text-purple-400 font-medium">
+                  <div className="flex items-center space-x-3">
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                    <span>Processing {progressIndex}/{videoItems.length}</span>
+                  </div>
+                  <span className="text-xs text-gray-400 text-center">{progressMsg}</span>
+                </div>
+              ) : (
                 <button
                   onClick={convertToGif}
-                  disabled={endTime - startTime <= 0}
+                  disabled={!hasValidDimensions || endTime - startTime <= 0}
                   className="w-full py-4 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 font-medium rounded-xl shadow-lg shadow-purple-500/10 hover:shadow-purple-500/25 disabled:opacity-50 disabled:cursor-not-allowed transition duration-300 flex items-center justify-center space-x-2"
                 >
                   <Sparkles className="w-5 h-5 animate-pulse" />
-                  <span>Convert using FFmpeg</span>
+                  <span>Convert {videoItems.length} GIF{videoItems.length > 1 ? 's' : ''}</span>
                 </button>
-              ) : (
-                <div className="space-y-2">
-                  <div className="w-full bg-[#121318] border border-white/10 rounded-xl px-4 py-3 flex flex-col items-center justify-center space-y-2">
-                    <div className="flex items-center space-x-2">
-                      <Loader2 className="w-4 h-4 text-purple-500 animate-spin" />
-                      <span className="text-sm font-medium text-purple-400">Processing in Browser</span>
-                    </div>
-                    <span className="text-xs text-gray-400 text-center">{progressMsg}</span>
-                  </div>
-                </div>
               )}
             </div>
 
-            {/* Results Render Box */}
-            {gifResult && (
+            {results.length > 0 && (
               <div className="glass-panel rounded-2xl p-6 space-y-4 border border-green-500/20">
                 <div className="flex justify-between items-center">
                   <span className="text-sm font-semibold text-green-400 flex items-center space-x-1.5">
                     <AlertCircle className="w-4 h-4" />
-                    <span>Conversion Ready!</span>
-                  </span>
-                  <span className="text-xs font-mono text-gray-400 bg-white/5 px-2 py-0.5 rounded">
-                    {formatBytes(gifSize)}
+                    <span>{results.length}/{videoItems.length} GIF Ready!</span>
                   </span>
                 </div>
-                <div className="rounded-xl overflow-hidden bg-black/40 p-2 flex justify-center border border-white/5 max-h-[300px]">
-                  <img src={gifResult} alt="Generated GIF" className="max-h-[280px] object-contain rounded" />
+                <div className="space-y-3 max-h-[420px] overflow-y-auto pr-1">
+                  {results.map((result) => (
+                    <div key={result.id} className="flex items-center gap-3 rounded-xl bg-black/30 border border-white/5 p-2">
+                      <img src={result.url} alt={`Generated GIF ${result.fileName}`} className="w-20 h-16 object-contain rounded bg-black/40" />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs text-gray-300 truncate" title={result.fileName}>{result.fileName}</p>
+                        <p className="text-[10px] text-gray-500">{result.width} × {result.height}px · {formatBytes(result.size)}</p>
+                      </div>
+                      <a
+                        href={result.url}
+                        download={getGifFileName(result.fileName)}
+                        className="shrink-0 p-2 rounded-lg bg-green-600 hover:bg-green-500 transition"
+                        aria-label={`${result.fileName} GIF 다운로드`}
+                        title="Download GIF"
+                      >
+                        <Download className="w-4 h-4" />
+                      </a>
+                    </div>
+                  ))}
                 </div>
-                <a
-                  href={gifResult}
-                  download={`${videoFile?.name.replace('.mp4', '') || 'converted'}.gif`}
-                  className="w-full py-3.5 bg-green-600 hover:bg-green-500 font-medium rounded-xl text-center flex items-center justify-center space-x-2 shadow-lg shadow-green-500/10 hover:shadow-green-500/20 transition"
-                >
-                  <Download className="w-5 h-5" />
-                  <span>Download GIF</span>
-                </a>
               </div>
             )}
+            {errorMessage && <p className="text-xs text-red-300">{errorMessage}</p>}
           </div>
         </div>
       )}
