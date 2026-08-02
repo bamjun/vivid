@@ -165,21 +165,25 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
 
   const handleScaleChange = (nextScale: number) => {
     setScale(nextScale);
-    const baseWidth = videoItems.length === 1 ? crop.width : videoItems[0]?.width ?? 0;
-    const baseHeight = videoItems.length === 1 ? crop.height : videoItems[0]?.height ?? 0;
+    const baseWidth = crop.width || videoItems[0]?.width || 0;
+    const baseHeight = crop.height || videoItems[0]?.height || 0;
     if (baseWidth > 0 && baseHeight > 0) {
       setOutputWidth(String(Math.max(1, Math.round(baseWidth * nextScale))));
       setOutputHeight(String(Math.max(1, Math.round(baseHeight * nextScale))));
     }
   };
 
+  const handleCropChange = (nextCrop: CropArea) => {
+    setCrop(nextCrop);
+    setOutputWidth(String(Math.max(1, Math.round(nextCrop.width * scale))));
+    setOutputHeight(String(Math.max(1, Math.round(nextCrop.height * scale))));
+  };
+
   const resetCrop = () => {
     const firstVideo = videoItems[0];
     if (!firstVideo) return;
 
-    setCrop({ x: 0, y: 0, width: firstVideo.width, height: firstVideo.height });
-    setOutputWidth(String(Math.max(1, Math.round(firstVideo.width * scale))));
-    setOutputHeight(String(Math.max(1, Math.round(firstVideo.height * scale))));
+    handleCropChange({ x: 0, y: 0, width: firstVideo.width, height: firstVideo.height });
   };
 
   const updateCropField = (field: keyof CropArea, value: string) => {
@@ -194,7 +198,7 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
     next.height = Math.max(1, Math.min(next.height, firstVideo.height));
     next.x = Math.max(0, Math.min(next.x, firstVideo.width - next.width));
     next.y = Math.max(0, Math.min(next.y, firstVideo.height - next.height));
-    setCrop(next);
+    handleCropChange(next);
   };
 
   const safeDelete = async (fileName: string) => {
@@ -203,6 +207,17 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
     } catch {
       // The file may not have been created if FFmpeg failed early.
     }
+  };
+
+  const getCropForVideo = (item: VideoItem): CropArea => {
+    const width = Math.max(1, Math.min(crop.width, item.width));
+    const height = Math.max(1, Math.min(crop.height, item.height));
+    return {
+      x: Math.max(0, Math.min(crop.x, item.width - width)),
+      y: Math.max(0, Math.min(crop.y, item.height - height)),
+      width,
+      height,
+    };
   };
 
   const convertToGif = async () => {
@@ -237,9 +252,8 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
         const effectiveStart = Math.max(0, Math.min(startTime, Math.max(0, item.duration - 0.1)));
         const effectiveEnd = Math.min(Math.max(effectiveStart + 0.1, endTime), item.duration);
         const duration = Math.max(0.1, effectiveEnd - effectiveStart);
-        const cropFilter = videoItems.length === 1
-          ? `crop=${Math.round(crop.width)}:${Math.round(crop.height)}:${Math.round(crop.x)}:${Math.round(crop.y)}`
-          : `crop=${item.width}:${item.height}:0:0`;
+        const itemCrop = getCropForVideo(item);
+        const cropFilter = `crop=${itemCrop.width}:${itemCrop.height}:${itemCrop.x}:${itemCrop.y}`;
         const filterString = `${cropFilter},scale=${targetWidth}:${targetHeight}:flags=lanczos,fps=${fps}`;
         const ditherConfig = dither === 'none' ? 'dither=none' : `dither=${dither}`;
 
@@ -358,7 +372,8 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
                     </div>
                   ))}
                 </div>
-                <p className="text-xs text-purple-300/80 mt-4">다중 변환은 각 영상 전체 화면을 사용합니다.</p>
+                <p className="text-xs text-gray-500 mt-4">Crop: X:{crop.x}, Y:{crop.y}, {crop.width}x{crop.height}</p>
+                <p className="text-xs text-purple-300/80 mt-2">입력한 Crop Area를 모든 영상에 공통 적용합니다. 원본보다 작은 영상은 범위 안으로 자동 보정됩니다.</p>
               </div>
             ) : (
               <>
@@ -375,7 +390,7 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
                       mediaWidth={firstVideo.width}
                       mediaHeight={firstVideo.height}
                       crop={crop}
-                      setCrop={setCrop}
+                      setCrop={handleCropChange}
                       mediaRef={videoRef}
                     />
                   )}
@@ -443,7 +458,7 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
                         step={1}
                         value={crop.x}
                         onChange={(event) => updateCropField('x', event.target.value)}
-                        disabled={isBatch || isProcessing}
+                        disabled={isProcessing}
                         className="w-full bg-[#121318] border border-purple-500/30 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition disabled:opacity-50"
                       />
                     </div>
@@ -456,7 +471,7 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
                         step={1}
                         value={crop.y}
                         onChange={(event) => updateCropField('y', event.target.value)}
-                        disabled={isBatch || isProcessing}
+                        disabled={isProcessing}
                         className="w-full bg-[#121318] border border-purple-500/30 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition disabled:opacity-50"
                       />
                     </div>
@@ -469,7 +484,7 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
                         step={1}
                         value={crop.width}
                         onChange={(event) => updateCropField('width', event.target.value)}
-                        disabled={isBatch || isProcessing}
+                        disabled={isProcessing}
                         className="w-full bg-[#121318] border border-purple-500/30 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition disabled:opacity-50"
                       />
                     </div>
@@ -482,7 +497,7 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
                         step={1}
                         value={crop.height}
                         onChange={(event) => updateCropField('height', event.target.value)}
-                        disabled={isBatch || isProcessing}
+                        disabled={isProcessing}
                         className="w-full bg-[#121318] border border-purple-500/30 rounded-xl px-4 py-2 text-sm focus:outline-none focus:border-purple-500 transition disabled:opacity-50"
                       />
                     </div>
@@ -520,7 +535,7 @@ export const VideoToGif: React.FC<VideoToGifProps> = ({ onSuccess }) => {
                       />
                     </div>
                   </div>
-                  <span className="text-[10px] text-purple-300 block mt-2">입력한 가로·세로 크기가 모든 GIF에 적용됩니다.</span>
+                  <span className="text-[10px] text-purple-300 block mt-2">크롭 영역에 Scale Preset을 적용한 값이 기본 출력 크기입니다. 직접 입력하면 출력 크기를 덮어쓸 수 있습니다.</span>
                 </div>
 
                 <div>
